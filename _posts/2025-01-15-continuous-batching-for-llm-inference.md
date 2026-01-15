@@ -348,93 +348,238 @@ When serving Large Language Models (LLMs) in production, efficient GPU utilizati
 In this post, I'll walk through my [PyTorch implementation of continuous batching](https://github.com/hawkeoni/continuous_batching_pytorch) and explain the core algorithm that achieves **~40% faster inference** compared to synchronous batching.
 
 
-## Core Algorithm
+## The Continuous Batching Algorithm
 
-Here's the high-level algorithm:
+Here's the core generation loop:
 
 ```python
-def continuous_batch(texts: List[str]) -> List[str]:
-    results = [None] * len(texts)
-    batch = initialize_batch(texts[:batch_size])
-    next_idx = batch_size
+def _run_generation_loop(self, texts, batch, results, pbar):
+    next_text_idx = self.config.batch_size
 
-    while has_work_remaining(batch, next_idx, texts):
-        # Check if we should prefill waiting samples
-        if should_prefill(batch):
-            prefill_waiting_samples(batch)
+    while self._should_continue_generation(batch, next_text_idx, len(texts)):
+        # Add waiting texts to batch if threshold met
+        if self._should_prefill(batch):
+            self._prefill_waiting_texts(batch)
 
         # Generate one token for all active samples
-        generate_one_step(batch)
+        self._generate_one_step(batch)
 
-        # Check for completed samples
-        finished = collect_finished_samples(batch)
+        # Check for completed samples and swap in new ones
+        finished_text_ids, finished_texts = self._collect_finished_samples(batch)
 
-        if finished:
-            save_results(results, finished)
-            add_new_samples_to_waiting(batch, texts, next_idx)
-
-    return results
+        if finished_texts:
+            self._save_results(results, finished_text_ids, finished_texts)
+            next_text_idx = self._add_new_waiting_texts(
+                batch, texts, next_text_idx, len(finished_texts)
+            )
 ```
 
-### The Prefill Decision
+Notice that `batch_size` appears seemingly out of nowhere—it's a configuration parameter that limits how many sequences we process simultaneously. In production frameworks like vLLM or TensorRT-LLM, the limit isn't a fixed sample count but rather a **cumulative token budget** (total tokens across all sequences in the batch). This allows for dynamic allocation: many short sequences or fewer long ones. For simplicity, we use a fixed batch size here.
 
-A critical question: **when should we prefill waiting samples?**
+Let's break down each component.
 
-Too aggressive (prefill immediately) → frequent context switches, overhead
-Too conservative (wait for batch to empty) → approaches synchronous batching
+---
 
-My implementation uses a `fraction` parameter:
+### Prefill Decision: When to Add New Sequences
 
 ```python
-def should_prefill(batch) -> bool:
-    return len(waiting_samples) >= len(generating_samples) * fraction
+def _should_prefill(self, batch: _Batch) -> bool:
+    has_capacity = len(batch.texts_decoding) < self.config.batch_size
+    meets_threshold = (
+        len(batch.texts_waiting) >=
+        len(batch.texts_decoding) * self.config.fraction
+    )
+    return has_capacity and meets_threshold
 ```
 
-With `fraction=0.5` and 10 generating samples, we prefill when 5+ samples are waiting.
-This balances out the long sequences.
+We prefill when two conditions are met:
+1. **Capacity**: The batch isn't full yet
+2. **Threshold**: Waiting texts meet a fraction threshold relative to active texts
 
+The `fraction` parameter controls how aggressively we batch new requests. A fraction of 1.0 means "wait until we have as many waiting requests as active ones before prefilling." A fraction of 0.0 would prefill immediately whenever there's capacity.
 
-## Key Implementation Challenges
+**Note:** Production frameworks use more sophisticated decision rules. They might consider:
+- Current memory pressure and KV cache utilization
+- Estimated completion time of active sequences
+- Priority levels of waiting requests
+- Whether prefill would cause memory reallocation
 
-### 1. KV Cache Management
+Our simple threshold-based approach works well enough for demonstration purposes.
 
-The KV cache stores attention keys and values from previous tokens. When mixing sequences of different lengths, we must carefully align the cache:
+---
 
-```
-Existing sequence: [====tokens====|generated|]
-New sequence:      [pad|=tokens=|pad|generated|]
-                   ↑ Padding to align with existing cache length
-```
-
-<!-- TODO: Add code snippet showing cache expansion -->
-
-### 2. Attention Mask Handling
-
-When sequences have different lengths, we need proper masking:
+### Prefill Stage: Building the KV Cache
 
 ```python
-# Convert attention mask to position IDs
-position_ids = attention_mask.long().cumsum(-1) - 1
-position_ids.masked_fill_(attention_mask == 0, 1)
+def _prefill_waiting_texts(self, batch: _Batch) -> None:
+    # Tokenize waiting texts
+    inputs = self._tokenize_waiting_texts(batch.texts_waiting)
+
+    # Run prefill forward pass
+    prefill_outputs = self.model(**inputs, use_cache=True)
+
+    # Initialize or expand the batch
+    if self._is_first_prefill(batch):
+        self._initialize_batch_from_prefill(batch, prefill_outputs, inputs)
+    else:
+        self._expand_batch_with_prefill(batch, prefill_outputs, inputs)
 ```
 
-This ensures each token attends only to valid previous tokens, not padding.
+The prefill stage processes complete input sequences to build their KV cache. Here's what happens:
 
-### 3. Batch State Tracking
+1. **Tokenize** all waiting texts into padded tensors
+2. **Forward pass** through the model with `use_cache=True` — this returns both logits and the computed KV cache
+3. **Store the KV cache** for future decode steps
 
-We track multiple pieces of state per sequence:
+When expanding an existing batch with new sequences, we need to handle a tricky alignment problem. The existing sequences have been generating for a while, so their KV cache is longer than the newly prefilled sequences:
+
+```
+[IMAGE PLACEHOLDER: KV Cache Alignment During Prefill Expansion]
+
+Existing sequences (already generating):
+┌─────────────────────────────────────────────────────────┐
+│ KV Cache: [prompt tokens] [generated tokens...]         │
+│ Length: 50 tokens                                       │
+└─────────────────────────────────────────────────────────┘
+
+New sequences (just prefilled):
+┌─────────────────────────────────────┐
+│ KV Cache: [prompt tokens]           │
+│ Length: 20 tokens                   │
+└─────────────────────────────────────┘
+
+After padding and concatenation:
+┌─────────────────────────────────────────────────────────┐
+│ Existing: [prompt tokens      ] [generated tokens...]   │
+│ New:      [padding: 0 0 0 ... ] [prompt tokens     ]    │
+│           ↑ 30 zeros padded    ↑ attention mask = 0     │
+└─────────────────────────────────────────────────────────┘
+```
+
+The code handles this with explicit padding:
 
 ```python
-@dataclass
-class Batch:
-    text_ids: List[int]           # Original indices for result ordering
-    input_ids: torch.Tensor       # Current token being decoded
-    attention_mask: torch.Tensor  # Valid token positions
-    past_key_values: DynamicCache # KV cache per layer
-    generated_tokens: List[List[int]]  # Output tokens per sequence
+def _expand_kv_cache(self, batch, prefill_outputs):
+    existing_seqlen = batch.past_key_values.layers[0].keys.size(2)
+    new_seqlen = prefill_outputs.past_key_values.layers[0].keys.size(2)
+    padding_seqlen = existing_seqlen - new_seqlen
+
+    # Create zero padding and concatenate
+    padding_template = torch.zeros(...)
+    for layer_idx in range(self.model.config.num_hidden_layers):
+        # Keys: [padding | new_keys] then concat with existing
+        padded_keys = torch.cat((padding_template, new_layer_cache.keys), dim=2)
+        layer_cache.keys = torch.cat((layer_cache.keys, padded_keys), dim=0)
 ```
 
-<!-- TODO: Expand on the _Batch dataclass implementation -->
+---
+
+### Generate One Step: The Decode Phase
+
+```python
+def _generate_one_step(self, batch: _Batch) -> None:
+    step_outputs = self.model(
+        input_ids=batch.input_ids,           # [batch_size, 1] - just the last token
+        attention_mask=batch.attention_mask, # [batch_size, seq_len] - full history
+        position_ids=batch.position_ids,     # [batch_size, 1] - current position
+        past_key_values=batch.past_key_values,
+        use_cache=True,
+    )
+
+    # Get next tokens from logits
+    batch.input_ids = step_outputs.logits[:, 0].argmax(dim=1, keepdim=True)
+
+    # Extend attention mask for next step
+    batch.attention_mask = torch.cat(
+        (batch.attention_mask, torch.ones_like(batch.attention_mask[:, 0:1])),
+        dim=1
+    )
+
+    # Increment generation counter
+    batch.generated_tokens_counter += 1
+```
+
+Each decode step processes all active sequences in parallel. The key insight is that we only pass the **last generated token** as input (`input_ids` has shape `[batch_size, 1]`), while the KV cache contains the full history.
+
+After each step, the KV cache grows by one position for every sequence:
+
+```
+[IMAGE PLACEHOLDER: KV Cache Growth During Decode Steps]
+
+Step 0 (after prefill):
+Seq 1: [████████████████████] len=20
+Seq 2: [████████████████████] len=20
+Seq 3: [████████████████████] len=20
+
+Step 5:
+Seq 1: [████████████████████▓▓▓▓▓] len=25
+Seq 2: [████████████████████▓▓▓▓▓] len=25
+Seq 3: [████████████████████▓▓▓▓▓] len=25
+
+Step 10:
+Seq 1: [████████████████████▓▓▓▓▓▓▓▓▓▓] len=30
+Seq 2: [████████████████████▓▓▓▓▓▓▓▓▓▓] len=30
+Seq 3: [████████████████████▓▓▓▓▓▓▓▓▓▓] len=30
+
+█ = prefilled tokens    ▓ = generated tokens
+```
+
+The attention mask and position IDs are also extended each step to account for the new token.
+
+---
+
+### Collecting Finished Samples: Stopping Criteria and Cache Surgery
+
+```python
+def _find_finished_indices(self, batch: _Batch) -> List[int]:
+    # Check if sample hit EOS or max length
+    is_eos = batch.input_ids == self.tokenizer.eos_token_id
+    is_max_length = (
+        batch.generated_tokens_counter.unsqueeze(1) >=
+        self.config.max_new_tokens
+    )
+
+    finished_mask = (is_eos | is_max_length).view(-1).long()
+    finished_indices = finished_mask.nonzero().view(-1).tolist()
+    return finished_indices
+```
+
+A sequence finishes when either:
+1. **EOS token**: The model generated the end-of-sequence token
+2. **Max length**: The sequence reached the configured `max_new_tokens` limit
+
+When sequences finish, we need to surgically remove them from all batch tensors:
+
+```python
+def _remove_samples_from_batch(self, batch, keep_indices):
+    batch.input_ids = batch.input_ids.index_select(0, keep_indices)
+    batch.position_ids = batch.position_ids.index_select(0, keep_indices)
+    batch.attention_mask = batch.attention_mask.index_select(0, keep_indices)
+    batch.generated_tokens_counter = batch.generated_tokens_counter.index_select(0, keep_indices)
+
+    # Remove from KV cache - this is expensive!
+    for layer_idx in range(self.model.config.num_hidden_layers):
+        layer_cache = batch.past_key_values.layers[layer_idx]
+        layer_cache.keys = layer_cache.keys.index_select(0, keep_indices)
+        layer_cache.values = layer_cache.values.index_select(0, keep_indices)
+```
+
+**This is expensive.** The `index_select` operation on the KV cache allocates new memory and copies all the data for the remaining sequences. For a model with 32 layers, we're doing 64 tensor copies (keys + values for each layer). With large batch sizes and long sequences, this becomes a significant overhead.
+
+Production frameworks solve this with sophisticated memory management:
+- **PagedAttention** (vLLM): Treats KV cache as virtual memory pages, allowing non-contiguous storage and efficient "freeing" of finished sequences
+- **Pre-allocated pools**: Reserve maximum memory upfront and manage slots with indices rather than copying
+- **In-place compaction**: Move data within the same buffer rather than allocating new ones
+
+Our naive implementation just accepts the performance hit for simplicity.
+
+**Important connection to prefill decision:** Notice how `_collect_finished_samples` modifies `batch.texts_decoding` by removing finished sequences. This directly affects the `_should_prefill` check:
+
+```python
+has_capacity = len(batch.texts_decoding) < self.config.batch_size
+```
+
+When sequences finish and are removed, `len(batch.texts_decoding)` decreases, creating capacity for new sequences to be prefilled. This is the core of continuous batching—finished sequences create "slots" that waiting sequences can fill.
 
 ## Benchmark Results
 
