@@ -28,6 +28,8 @@ One of the optimizations that is **an absolute must** in any inference of a tran
 I'd also recommend you give a read to official [huggingface post about continous batching](https://huggingface.co/blog/continuous_batching) because it describes the process of autoregressive token generation in great detail, but I'll give the gist of it.
 
 
+TODO: Add diagram of causal attention and KV cache
+
 First of all: **because of the causal mask attention is the only transformer layer where tokens interact with each other, that means that this is the only layer which works on the whole sequence.** All other layers such as FFN (MLP), positional embeddings (absolute or RoPE), layernorms and final linear layer **work on each token independently and do not require the whole sequence**. Only the famous attention layer 
 $\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$ requires full matrices Q, K, V of shape \[sequence_length, hidden_dim\] - all the other layers can correctly work on each token vector of size \[hidden_dim\].
 
@@ -303,15 +305,15 @@ Turn    | Request 1 (short)     | Request 2 (long)
   2     | ","                   | "and"
   3     | "Python"              | "UDP"
   4     | "is"                  | "are"
-  5     | "\<EOS\>"               | "both"
-  6     | \<padding>             | "transport"
-  7     | \<padding>             | "layer"
-  8     | \<padding>             | "protocols"
-  9     | \<padding>             | "."
- 10     | \<padding>             | "TCP"
- 11     | \<padding>             | "provides"
- ...    | \<padding>             | ...
- 30     | \<padding>             | "\<EOS>"
+  5     | "\<EOS>"              | "both"
+  6     | \<padding>            | "transport"
+  7     | \<padding>            | "layer"
+  8     | \<padding>            | "protocols"
+  9     | \<padding>            | "."
+ 10     | \<padding>            | "TCP"
+ 11     | \<padding>            | "provides"
+ ...    | \<padding>            | ...
+ 30     | \<padding>            | "\<EOS>"
 
 The problem is clear: Request 1 finishes at turn 5, but we can't return its response to the user until Request 2 completes at turn 30. Meanwhile, the GPU slot for Request 1 sits idle, wasting compute on generating tokens that the user will not see because generation was terminated with \<EOS>. What we'd like to do is switch request 1 for request 3 after it finishes so we'd never lose compute. 
 
@@ -338,45 +340,13 @@ The problem here is that generation consists of 2 stages: prefill and decode and
 
 TODO: write somewhere better that prefilling is basically KV-cache generation. In the next section we'll explore the naive continous batching algorithm in pytorch, how it manages memory and interleaves prefill stages with decode steps.
 
+TODO: Add diagram showing prefill vs generation phases
 
 
 When serving Large Language Models (LLMs) in production, efficient GPU utilization is critical. Traditional batch processing has a fundamental flaw: all sequences in a batch must wait for the longest one to finish. Enter **continuous batching** - the technique that enables systems like vLLM and HuggingFace TGI to achieve remarkable throughput improvements.
 
 In this post, I'll walk through my [PyTorch implementation of continuous batching](https://github.com/hawkeoni/continuous_batching_pytorch) and explain the core algorithm that achieves **~40% faster inference** compared to synchronous batching.
 
-## The Problem with Synchronous Batching
-
-In traditional (synchronous) batching, we process requests like this:
-
-```
-Time:    |-----Batch 1-------|-----Batch 2-------|
-GPU:     |████████████████100%|████░░░░░░░░░░░░60%|
-                               ↑ Samples finish at different times
-                                 GPU sits idle waiting
-```
-
-The issue: when processing a batch of prompts, some will generate short responses (e.g., 10 tokens) while others generate long ones (e.g., 500 tokens). The GPU must wait for the slowest sequence before moving to the next batch.
-
-## How Continuous Batching Works
-
-Continuous batching solves this by treating the model as a **stream processor**:
-
-```
-Time:    |---A---|---B---|---C---|---D---|---E---|
-GPU:     |███████|███████|███████|███████|███████|
-         ↑ New samples fill gaps as others complete
-```
-
-The key insight: **as soon as one sequence finishes, we can inject a new one into the batch**.
-
-### The Two Phases
-
-Continuous batching alternates between two phases:
-
-1. **Prefill Phase**: Process the input prompt tokens (compute-heavy, fills KV cache)
-2. **Generation Phase**: Generate one token at a time for all active sequences
-
-<!-- TODO: Add diagram showing prefill vs generation phases -->
 
 ## Core Algorithm
 
@@ -421,8 +391,8 @@ def should_prefill(batch) -> bool:
 ```
 
 With `fraction=0.5` and 10 generating samples, we prefill when 5+ samples are waiting.
+This balances out the long sequences.
 
-<!-- TODO: Add benchmark results for different fraction values -->
 
 ## Key Implementation Challenges
 
@@ -477,42 +447,6 @@ Testing with **Qwen3-8B** on 100 samples:
 | Per-sample Latency | 3.19s | 1.94s | **39% lower** |
 | Correctness | - | 99% match | - |
 
-<!-- TODO: Add graphs showing throughput over time -->
-
-## When to Use Continuous Batching
-
-Continuous batching shines when:
-
-- **Variable output lengths**: Some responses are short, others long
-- **High request volume**: Many concurrent requests to process
-- **Latency-sensitive**: Users waiting for responses
-
-It's less beneficial when:
-- All sequences generate similar-length outputs
-- Batch size is 1 (no batching to optimize)
-- Memory is the bottleneck, not compute
-
-## Implementation Tips
-
-If you're implementing continuous batching yourself:
-
-1. **Start with synchronous batching** - get correctness first, then optimize
-2. **Use `DynamicCache`** from transformers - handles KV cache expansion
-3. **Profile extensively** - use PyTorch profiler to find bottlenecks
-4. **Test correctness** - compare outputs against synchronous batching
-
-<!-- TODO: Add link to profiling code -->
-
-## Comparison with Production Systems
-
-My implementation is educational. Production systems like vLLM add:
-
-- **PagedAttention**: More efficient memory management
-- **Speculative decoding**: Predict multiple tokens at once
-- **Tensor parallelism**: Distribute across multiple GPUs
-- **Request scheduling**: Priority queues, fairness policies
-
-<!-- TODO: Add section on PagedAttention basics -->
 
 ## Conclusion
 
@@ -520,17 +454,101 @@ Continuous batching is a fundamental technique for efficient LLM serving. By dyn
 
 The full implementation is available at [github.com/hawkeoni/continuous_batching_pytorch](https://github.com/hawkeoni/continuous_batching_pytorch).
 
-## Further Reading
+## Advanced topics
+Chunked prefill is a technique where prefill stage is split into stpes.
+For example we have a sequence of length 8000 and we want to prefill it in chunks of 1000 tokens, so the prefill would go as:
 
-- [Orca: A Distributed Serving System for Transformer-Based Generative Models](https://www.usenix.org/conference/osdi22/presentation/yu) - The paper that introduced continuous batching
-- [vLLM: Easy, Fast, and Cheap LLM Serving](https://github.com/vllm-project/vllm) - Production implementation with PagedAttention
-- [HuggingFace TGI](https://github.com/huggingface/text-generation-inference) - Another production-grade implementation
 
-<!--
-TODO: Future additions
-- [ ] Add diagrams for prefill vs generation phases
-- [ ] Include benchmark graphs
-- [ ] Add code walkthrough section
-- [ ] Expand on PagedAttention
-- [ ] Add interactive demo link
--->
+Iteration 1:
+
+Take tokens 0–999 (first 1k chunk)
+Run forward pass, compute attention over these 1k tokens
+Store KV cache for positions 0–999
+No token generated yet (still prefilling)
+Iteration 2:
+
+Take tokens 1000–1999
+Run forward pass, attention can now attend to positions 0–1999 (using cached KV for 0–999, computing new for 1000–1999)
+Append KV cache for positions 1000–1999
+Still no token generated
+Iteration 3:
+
+Tokens 2000–2999
+Attention over 0–2999
+KV cache grows
+...continues...
+
+Iteration 8:
+
+Tokens 7000–7999 (final chunk)
+Attention over full 0–7999
+KV cache now complete for entire prompt
+Iteration 9:
+
+Now decode phase begins
+Generate first output token
+Append its KV to cache
+The key insight:
+
+Each chunk only computes new KV entries, but attends to all previous KV entries from the cache. So chunk 5 computes KV for tokens 4000–4999 but attends to 0–4999.
+
+Why this matters for continuous batching:
+
+Between iterations 1–8, if another request's decode step is ready, you can batch them together. So iteration 3 might look like:
+
+Prefill chunk (tokens 2000–2999) for request A
+Decode step (1 token) for request B
+Decode step (1 token) for request C
+All in one forward pass, keeping everyone moving.
+
+
+You can read more about chunked prefill here https://arxiv.org/pdf/2308.16369 and here https://huggingface.co/blog/tngtech/llm-performance-prefill-decode-concurrent-requests
+
+
+
+Another trick is Paged attention it is a memory management technique for KV caches, introduced in the [vLLM paper](https://arxiv.org/pdf/2309.06180).
+
+The problem it solves:
+
+In standard attention, you pre-allocate a contiguous block of memory for each sequence's KV cache based on the maximum possible length. If your max length is 8k but a sequence only uses 500 tokens, you've wasted memory for 7500 tokens. And you can't reclaim it mid-inference.
+
+This leads to massive memory fragmentation and waste, limiting how many sequences you can batch together.
+
+How paged attention works:
+
+Borrow the idea from OS virtual memory—instead of contiguous allocation, divide KV cache into fixed-size blocks (pages), like 16 or 32 tokens each.
+
+Each sequence gets a block table that maps logical positions to physical memory blocks. Blocks are allocated on demand as the sequence grows.
+
+Example:
+
+Sequence A needs 50 tokens of KV cache:
+
+Allocate block 0 → physical block 7
+Allocate block 1 → physical block 3
+Allocate block 2 → physical block 12
+The blocks don't need to be contiguous in GPU memory. The block table tracks where everything lives.
+
+Benefits:
+
+Near-zero waste: Only allocate what you actually use
+No fragmentation: Blocks are uniform size, any free block works
+Higher batch sizes: Memory savings let you fit more concurrent sequences
+Easy memory sharing: For beam search or parallel sampling, multiple sequences can point to the same physical blocks for shared prefixes
+Tradeoff:
+
+Slightly more complex attention kernel—instead of one contiguous read, you gather from scattered blocks. But the memory efficiency gains far outweigh this.
+
+It's one of the core innovations that made vLLM so much more efficient than naive serving implementations.
+
+so this is just for memory efficiency without speedup? the speed is probably worse because of the lack of contiguous blocks of memory?
+
+Exactly right. Paged attention by itself is a memory optimization, not a speed optimization. The attention kernel is actually slightly slower due to the indirection and non-contiguous memory access.
+
+But—and this is the key—the memory savings indirectly lead to higher throughput.
+
+If you can fit 3x more sequences in a batch because you're not wasting memory, your GPU utilization goes up and you process more tokens per second overall, even if each individual attention operation is marginally slower.
+
+
+The vLLM paper showed something like 2-4x throughput improvements over HuggingFace's naive implementation, almost entirely from being able to batch more sequences thanks to memory efficiency.
+
