@@ -288,9 +288,55 @@ So to summarize the ideas behind KV cache are:
 
 
 # Pitfalls of naive generation and Continous Batching algorithm
-Now that we understand how KV-cache allows us to circumvent cubic generation time let's take a look at another problem associated with  transformer infenrece
+Now that we understand how KV-cache allows us to circumvent cubic generation time let's take a look at another problem associated with  transformer inference: generating on sequences of various lengths.
+All modern frameworks batch user requests together - serving them one by one would underutilize the GPU and work slowly, so it makes sense to batch generation together. The problem here is that all sequence require answers of different lengths. For example let's say you've bathced 2 requests from different user, one simple yes or no question and the other question requires more tokens. For example:
+
+Request 1: "Is Python dynamically typed? Answer yes or no."
+Request 2: "Explain the difference between TCP and UDP protocols."
+
+Here's how generation proceeds with naive batching after the prefill stage:
 
 
+Turn    | Request 1 (short)     | Request 2 (long)
+--------|-----------------------|------------------------
+  1     | "Yes"                 | "TCP"
+  2     | ","                   | "and"
+  3     | "Python"              | "UDP"
+  4     | "is"                  | "are"
+  5     | "\<EOS\>"               | "both"
+  6     | \<padding>             | "transport"
+  7     | \<padding>             | "layer"
+  8     | \<padding>             | "protocols"
+  9     | \<padding>             | "."
+ 10     | \<padding>             | "TCP"
+ 11     | \<padding>             | "provides"
+ ...    | \<padding>             | ...
+ 30     | \<padding>             | "\<EOS>"
+
+The problem is clear: Request 1 finishes at turn 5, but we can't return its response to the user until Request 2 completes at turn 30. Meanwhile, the GPU slot for Request 1 sits idle, wasting compute on generating tokens that the user will not see because generation was terminated with \<EOS>. What we'd like to do is switch request 1 for request 3 after it finishes so we'd never lose compute. 
+
+For example if Request 3 is "What is the capital of Paris" the generations may look something like this:
+
+Turn    | Slot A                | Slot B
+--------|-----------------------|------------------------
+  1     | Req1: "Yes"           | Req2: "TCP"
+  2     | Req1: ","             | Req2: "and"
+  3     | Req1: "Python"        | Req2: "UDP"
+  4     | Req1: "is"            | Req2: "are"
+  5     | Req1: "<EOS>" ✓ DONE  | Req2: "both"
+  6     | Req3: "The"    ← NEW  | Req2: "transport"
+  7     | Req3: "capital"       | Req2: "layer"
+  8     | Req3: "is"            | Req2: "protocols"
+  9     | Req3: "Paris"         | Req2: "."
+ 10     | Req3: "<EOS>" ✓ DONE  | Req2: "TCP"
+ 11     | Req4: "..." ← NEW     | Req2: "provides"
+ ...    |                       | ...
+
+This is the core idea behind continuous batching: instead of waiting for the entire batch to complete, we continuously swap finished requests out and new requests in, maximizing GPU utilization and minimizing user latency. Request 1's response is returned immediately at turn 5, rather than waiting 25 more turns for Request 2 to finish and request 3 to start.
+
+The problem here is that generation consists of 2 stages: prefill and decode and before we start generating Request 3 we need to actually prefill it and swap KV cache of Req1 to KV cache of Req3!
+
+TODO: write somewhere better that prefilling is basically KV-cache generation. In the next section we'll explore the naive continous batching algorithm in pytorch, how it manages memory and interleaves prefill stages with decode steps.
 
 
 
