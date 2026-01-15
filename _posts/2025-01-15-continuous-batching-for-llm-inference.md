@@ -11,346 +11,300 @@ description: "A deep dive into continuous batching - the technique that powers e
 
 # Introduction
 
-One day I was reading a lecture about LLM inference frameworks and what optimizations make them fast: dynamic batching, efficient memory management (memory reuse), efficient kernels/fused operations, various model parallellisms (tensor parallel/pipeline parallel inference), quantization, speculative decoding, **KV-cache** and **continous batching**. After I described continous batching one of the students asked if there was a simple implementation. I knew that digging in the source code of such frameworks as [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), [vLLM](https://github.com/vllm-project/vllm) or [SGLang](https://github.com/sgl-project/sglang) would be too hard, so I tried looking for some open source implementations. This was before [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm), [mini-SGLang](https://github.com/sgl-project/mini-sglang) or support of [contionous batching in transformers](https://huggingface.co/docs/transformers/main/continuous_batching) so I've searched the internet and found a link to a [reference implementation in pytorch](https://inspiringlab.com.np/implementing-continuous-batching-from-scratch-with-pytorch/) which looked __good enough__. I however quickly found that this was not the case: the code did not work. In fact it did not constitute a program: there were no imports, the code referenced classes and functions that were never described anywhere and not matter how you permuted the provided code snippets you could never compose anything that would launch. I guess it could be considered almost a pseudo-code implementation, but this was not something that I was looking for, so I took it upon myself to write a simple implementation in pytorch.
+One day I was reading a lecture about LLM inference frameworks and what optimizations make them fast: dynamic batching, efficient memory management (memory reuse), efficient kernels/fused operations, various model parallellisms (tensor parallel/pipeline parallel inference), quantization, speculative decoding, **KV-cache** and **continuous batching**. After I described continuous batching one of the students asked if there was a simple implementation. I knew that digging in the source code of such frameworks as [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), [vLLM](https://github.com/vllm-project/vllm) or [SGLang](https://github.com/sgl-project/sglang) would be too hard, so I tried looking for some open source implementations. This was before [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm), [mini-SGLang](https://github.com/sgl-project/mini-sglang) or support of [continuous batching in transformers](https://huggingface.co/docs/transformers/main/continuous_batching) so I've searched the internet and found a link to a [reference implementation in pytorch](https://inspiringlab.com.np/implementing-continuous-batching-from-scratch-with-pytorch/) which looked __good enough__. I however quickly found that this was not the case: the code did not work. In fact it did not constitute a program: there were no imports, the code referenced classes and functions that were never described anywhere and no matter how you permuted the provided code snippets you could never compose anything that would launch. I guess it could be considered almost a pseudo-code implementation, but this was not something that I was looking for, so I took it upon myself to write a simple implementation in pytorch.
 
-TODO: remake this as CONTENTS so it is a nice table
+**In this post I will cover:**
+- How autoregressive generation works in decoder-only transformers
+- The KV-cache optimization and why it's essential
+- The prefill and decode phases of generation
+- Why naive batching wastes compute and how continuous batching solves it
+- A walkthrough of a naive continuous batching implementation in PyTorch
+- Benchmark results showing ~40% speedup over synchronous batching
+- Advanced topics: chunked prefill and paged attention
 
-In this blogpost I will describe the following:
-* A small intro to KV cache in transformers and why it works
-* Drawbacks of naive inference algorithms and how continous batching solves them
-* Walkthrough of naive continous batching in pytorch
-* Analysis of the algorithm and comparison to [native transformers continous batching](https://huggingface.co/docs/transformers/main/continuous_batching)
-* Additional reading materials
+The full implementation is available at [github.com/hawkeoni/continuous_batching_pytorch](https://github.com/hawkeoni/continuous_batching_pytorch).
 
-# KV-Cache and token generation and prefill and decode stages
-One of the optimizations that is **an absolute must** in any inference of a transformer-decoder (which is the most common LLM architecture as of 2025) is KV-cache. To understand the following material you need to have a great understanding of basic transformer architecture and I recommend the original [Annotated Transformer](https://nlp.seas.harvard.edu/2018/04/03/attention.html), because I believe it still holds pretty well, but you may also go for something more modern such as [An even more annotated Transformer](https://pi-tau.github.io/posts/transformer/) or any other explaination that you like.
+---
 
-I'd also recommend you give a read to official [huggingface post about continous batching](https://huggingface.co/blog/continuous_batching) because it describes the process of autoregressive token generation in great detail, but I'll give the gist of it.
+# Background: Autoregressive Generation
 
+Before diving into optimizations, let's understand how decoder-only transformers (like GPT, LLaMA, Qwen) generate text.
 
-TODO: Add diagram of causal attention and KV cache
+Unlike models that produce output in one shot, these models generate **autoregressively**—one token at a time, where each new token is conditioned on all previous tokens. The generation loop looks like this:
 
-First of all: **because of the causal mask attention is the only transformer layer where tokens interact with each other, that means that this is the only layer which works on the whole sequence.** All other layers such as FFN (MLP), positional embeddings (absolute or RoPE), layernorms and final linear layer **work on each token independently and do not require the whole sequence**. Only the famous attention layer 
-$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$ requires full matrices Q, K, V of shape \[sequence_length, hidden_dim\] - all the other layers can correctly work on each token vector of size \[hidden_dim\].
+```
+Input: "The capital of France is"
 
-Second: only last token is used for prediction of the next token and because of the causal mask future tokens do not change representation of previous tokens. That means that we can cache outputs of previous tokens before calculating attention.
+Step 1: Model sees "The capital of France is" → predicts "Paris"
+Step 2: Model sees "The capital of France is Paris" → predicts ","
+Step 3: Model sees "The capital of France is Paris," → predicts "which"
+...and so on until we hit a stopping condition
+```
 
-Here we will have a walkhtrough of a small language model that generates tokens autoregressively with and without KV cache and discuss speedup because of KV-cache. You can read whole in one place code [here](https://gist.github.com/hawkeoni/2920d1a2f59840eb673455b40137c73c)
+Each step requires a full forward pass through the model. The key insight is that we're repeatedly processing the same prefix tokens over and over—"The capital of France is" gets processed in step 1, then again (along with "Paris") in step 2, and so on.
 
-First of all let's define a simplified transformer language model which does not have layernorms, residual connections or FFN layers - as stated above those layers work on tokens independently so this would not change the result and for simplicity we take them out.
+This is wasteful. Can we avoid recomputing the same thing repeatedly? Yes—that's where KV-cache comes in.
+
+---
+
+# KV-Cache: Avoiding Redundant Computation
+
+To understand the following material you need to have a basic understanding of transformer architecture. I recommend the original [Annotated Transformer](https://nlp.seas.harvard.edu/2018/04/03/attention.html), or something more modern like [An even more annotated Transformer](https://pi-tau.github.io/posts/transformer/).
+
+## Why KV-Cache Works
+
+Two key observations make KV-caching possible:
+
+**1. Attention is the only layer where tokens interact.**
+
+All other layers—FFN/MLP, layer norms, embeddings, the final linear layer—operate on each token independently. Only the attention layer requires the full sequence:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
+
+**2. Causal masking means past tokens don't change.**
+
+Because of the causal mask, token representations at position $i$ only depend on tokens at positions $0, 1, ..., i$. Adding a new token at position $i+1$ doesn't change the representations at earlier positions.
+
+This means we can **cache** the Key and Value projections from previous tokens and reuse them when generating new tokens.
+
+```
+[DIAGRAM PLACEHOLDER: Causal Attention Matrix]
+
+Show a lower-triangular attention matrix where:
+- Rows = query positions (which token is "asking")
+- Columns = key positions (which tokens can be "attended to")
+- Highlight that row i only has non-zero values in columns 0..i
+- Show that adding a new row doesn't change previous rows
+```
+
+## Generation Without KV-Cache (Naive)
+
+Let's walk through a minimal implementation. First, a simplified transformer that only has the components relevant to KV-caching:
 
 ```python
 class SimpleCausalAttentionLLM(nn.Module):
     """
     A minimal single-layer causal attention model for educational purposes.
-    This model implements:
-    1. Token embedding
-    2. Single-head self-attention with causal masking
-    3. Output projection to vocabulary
-    Note: Real LLMs have multiple layers, multi-head attention, layer norms,
-    feed-forward networks, and positional encodings. This is simplified to
-    focus on the KV-cache mechanism: those layers can be easily inserted into the model
-    because the operate on tokens independently and do not require the full sequence of tokens.
+
+    Real LLMs have multiple layers, multi-head attention, layer norms,
+    feed-forward networks, and positional encodings. We omit these because
+    they operate on tokens independently and don't affect the KV-cache logic.
     """
 
     def __init__(self, d_model: int, vocab_size: int):
         super().__init__()
         self.d_model = d_model
-
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.W_Q = nn.Linear(d_model, d_model)
         self.W_K = nn.Linear(d_model, d_model)
         self.W_V = nn.Linear(d_model, d_model)
-
         self.output_projection = nn.Linear(d_model, vocab_size)
-
 ```
 
-
-Let's define a simple forward that does the following: embeds tokens from input_ids, calculates causal attention and predicts the next token. 
+The forward pass computes full attention over the sequence:
 
 ```python
-
 def forward(self, input_ids: torch.Tensor) -> CausalAttentionOutput:
-        """
-        Standard forward pass - computes attention over the full sequence.
-        Used for initial "prefill" phase or when not using KV-cache.
-        """
-        # Step 1: Embed tokens
-        # [batch_size, seq_len] -> [batch_size, seq_len, d_model]
-        hidden_states = self.embedding(input_ids)
+    # Embed tokens: [batch, seq_len] -> [batch, seq_len, d_model]
+    hidden_states = self.embedding(input_ids)
 
-        # Step 2: Compute Query, Key, Value projections
-        # Each: [batch_size, seq_len, d_model]
-        queries = self.W_Q(hidden_states)
-        keys = self.W_K(hidden_states)
-        values = self.W_V(hidden_states)
+    # Compute Q, K, V projections
+    queries = self.W_Q(hidden_states)
+    keys = self.W_K(hidden_states)
+    values = self.W_V(hidden_states)
 
-        # Step 3: Compute attention scores
-        # Q @ K^T -> [batch_size, seq_len, seq_len]
-        # Each position attends to all other positions
-        attention_scores = torch.matmul(queries, keys.transpose(-2, -1))
+    # Attention scores: [batch, seq_len, seq_len]
+    attention_scores = torch.matmul(queries, keys.transpose(-2, -1))
 
-        # Step 4: Apply causal mask (lower triangular)
-        # This prevents tokens from attending to future tokens
-        # Essential for autoregressive generation
-        causal_mask = torch.tril(torch.ones_like(attention_scores))
-        attention_scores = attention_scores.masked_fill(
-            causal_mask == 0,
-            float('-inf')
-        )
+    # Apply causal mask (lower triangular)
+    causal_mask = torch.tril(torch.ones_like(attention_scores))
+    attention_scores = attention_scores.masked_fill(causal_mask == 0, float('-inf'))
 
-        # Step 5: Softmax to get attention weights
-        # [batch_size, seq_len, seq_len] - each row sums to 1
-        attention_weights = torch.softmax(attention_scores, dim=-1)
+    # Softmax and apply to values
+    attention_weights = torch.softmax(attention_scores, dim=-1)
+    context = torch.matmul(attention_weights, values)
 
-        # Step 6: Apply attention weights to values
-        # [batch_size, seq_len, seq_len] @ [batch_size, seq_len, d_model]
-        # -> [batch_size, seq_len, d_model]
-        context = torch.matmul(attention_weights, values)
+    # Project to vocabulary
+    logits = self.output_projection(context)
 
-        # Step 7: Project to vocabulary
-        logits = self.output_projection(context)
-
-        return CausalAttentionOutput(
-            logits=logits,
-            k_cache=keys,
-            v_cache=values,
-            attn_weights=attention_weights
-        )
+    return CausalAttentionOutput(
+        logits=logits,
+        k_cache=keys,
+        v_cache=values,
+    )
 ```
 
-As you can see full attention is calculated here and if we wanted to generate new tokens our generation function would look like this:
-
+Generation without cache reprocesses the entire sequence each step:
 
 ```python
-def generate_without_cache(
-    model: SimpleCausalAttentionLLM,
-    input_ids: torch.Tensor,
-    num_new_tokens: int
-) -> torch.Tensor:
-    """
-    Generate tokens WITHOUT KV-cache (naive approach).
-    For each new token, we reprocess the ENTIRE sequence from scratch.
-    
-    Complexity analysis:
-    - Step 1: process 1 token  → O(1)
-    - Step 2: process 2 tokens → O(4)
-    - Step N: process N tokens → O(N^2)
-    - Total: O(1^2 + 2^2 + ... + N^2) = O(N^3)
-    
-    This cubic complexity makes generation slow for long sequences.
-    """
+def generate_without_cache(model, input_ids, num_new_tokens):
     current_ids = input_ids.clone()
 
-    with torch.no_grad():
-        for _ in range(num_new_tokens):
-            # Recompute attention over the FULL sequence every time
-            outputs = model(current_ids)
-
-            # Get prediction for the last position
-            next_token_logits = outputs.logits[:, -1, :]
-            next_token = next_token_logits.argmax(dim=-1, keepdim=True)
-
-            # Append new token to sequence
-            current_ids = torch.cat([current_ids, next_token], dim=1)
+    for _ in range(num_new_tokens):
+        # Recompute attention over the FULL sequence every time
+        outputs = model(current_ids)
+        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        current_ids = torch.cat([current_ids, next_token], dim=1)
 
     return current_ids
 ```
 
-The problem here is that:
-* On each generation step the complexity of full attention calculation is quadratic, so for N steps the generation algorithm is actually cubic!
-* We constantly recalculate states for each token, however only the last token state is required to generate the next token
+**Complexity:** Each step processes a sequence of length $n$, with attention costing $O(n^2)$. Over $N$ generation steps: $O(1^2 + 2^2 + ... + N^2) = O(N^3)$.
 
-Let's see how we can solve it with KV-cache - the trick is simple - we only calculate attention of last token by all previous tokens and previous tokens do not get recalculated because they are independent of future tokens because of causal mask
+## Generation With KV-Cache (Optimized)
+
+With KV-cache, we only compute Q, K, V for the **new token** and reuse cached K, V from previous tokens:
 
 ```python
-def forward_with_kv_cache(
-        self,
-        input_ids: torch.Tensor,
-        past_output: CausalAttentionOutput
-    ) -> CausalAttentionOutput:
-        """
-        Optimized forward pass using KV-cache.
-        Only processes the NEW token, reusing cached K and V from previous tokens.
-        Instead of recomputing K and V for all previous tokens, we:
-        1. Compute Q, K, V only for the new token
-        2. Concatenate new K, V with cached K, V
-        3. Compute attention using full K, V but only new Q
-        """
-        # Embed only the new token
-        # [batch_size, 1] -> [batch_size, 1, d_model]
-        hidden_states = self.embedding(input_ids)
+def forward_with_kv_cache(self, input_ids, past_output):
+    # Embed only the new token: [batch, 1] -> [batch, 1, d_model]
+    hidden_states = self.embedding(input_ids)
 
-        # Compute Q, K, V for the new token only
-        # Each: [batch_size, 1, d_model]
-        new_query = self.W_Q(hidden_states)
-        new_key = self.W_K(hidden_states)
-        new_value = self.W_V(hidden_states)
+    # Compute Q, K, V for the new token only
+    new_query = self.W_Q(hidden_states)
+    new_key = self.W_K(hidden_states)
+    new_value = self.W_V(hidden_states)
 
-        # Retrieve cached K and V from previous tokens
-        # [batch_size, prev_seq_len, d_model]
-        cached_keys = past_output.k_cache
-        cached_values = past_output.v_cache
+    # Extend cache with new K, V
+    updated_keys = torch.cat([past_output.k_cache, new_key], dim=1)
+    updated_values = torch.cat([past_output.v_cache, new_value], dim=1)
 
-        # Extend cache with new K, V
-        # [batch_size, prev_seq_len + 1, d_model]
-        updated_keys = torch.cat([cached_keys, new_key], dim=1)
-        updated_values = torch.cat([cached_values, new_value], dim=1)
+    # New token attends to ALL tokens (no mask needed—it's the last position)
+    attention_scores = torch.matmul(new_query, updated_keys.transpose(-2, -1))
+    attention_weights = torch.softmax(attention_scores, dim=-1)
+    context = torch.matmul(attention_weights, updated_values)
 
-        # Compute attention: new token attends to ALL tokens (including itself)
-        # [batch_size, 1, d_model] @ [batch_size, d_model, seq_len+1]
-        # -> [batch_size, 1, seq_len+1]
-        attention_scores = torch.matmul(
-            new_query,
-            updated_keys.transpose(-2, -1)
-        )
+    logits = self.output_projection(context)
 
-        # No causal mask needed here! The new token is the last position,
-        # so it can attend to all previous tokens (and itself)
-        attention_weights = torch.softmax(attention_scores, dim=-1)
-
-        # Apply attention to get context for the new token
-        # [batch_size, 1, seq_len+1] @ [batch_size, seq_len+1, d_model]
-        # -> [batch_size, 1, d_model]
-        context = torch.matmul(attention_weights, updated_values)
-
-        # Project to vocabulary
-        logits = self.output_projection(context)
-
-        # Update the full attention weight matrix for visualization
-        # (This is optional and just for educational purposes)
-        batch_size = hidden_states.size(0)
-        prev_seq_len = cached_keys.size(1)
-
-        # Previous attention weights: [batch, prev_seq_len, prev_seq_len]
-        past_attn_weights = past_output.attn_weights
-
-        # Add zero column: old tokens don't attend to new token (causal)
-        zeros_column = torch.zeros(batch_size, prev_seq_len, 1)
-        past_attn_weights = torch.cat([past_attn_weights, zeros_column], dim=2)
-
-        # Add new token's attention row
-        full_attn_weights = torch.cat([past_attn_weights, attention_weights], dim=1)
-
-        # Note on memory efficiency: These concatenations (torch.cat) are costly for
-        # large models and long sequences because they allocate new memory and copy
-        # all existing data. Production implementations pre-allocate fixed-size buffers
-        # and write to specific indices instead. We use concatenation here for clarity.
-
-        return CausalAttentionOutput(
-            logits=logits,
-            k_cache=updated_keys,
-            v_cache=updated_values,
-            attn_weights=full_attn_weights
-        )
-
+    return CausalAttentionOutput(
+        logits=logits,
+        k_cache=updated_keys,
+        v_cache=updated_values,
+    )
 ```
 
-Then generation would look like this
+Generation with cache only processes one token per step:
+
 ```python
-def generate_without_cache(
-    model: SimpleCausalAttentionLLM,
-    input_ids: torch.Tensor,
-    num_new_tokens: int
-) -> torch.Tensor:
-    """
-    Generate tokens WITHOUT KV-cache (naive approach).
-    For each new token, we reprocess the ENTIRE sequence from scratch.
-    
-    Complexity analysis:
-    - Step 1: process 1 token  → O(1)
-    - Step 2: process 2 tokens → O(4)
-    - Step N: process N tokens → O(N^2)
-    - Total: O(1^2 + 2^2 + ... + N^2) = O(N^3)
-    
-    This cubic complexity makes generation slow for long sequences.
-    """
-    current_ids = input_ids.clone()
+def generate_with_cache(model, input_ids, num_new_tokens):
+    generated_ids = input_ids.clone()
 
-    with torch.no_grad():
-        for _ in range(num_new_tokens):
-            # Recompute attention over the FULL sequence every time
-            outputs = model(current_ids)
+    # PREFILL: Process the initial prompt, build KV cache
+    outputs = model(input_ids)
+    next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
-            # Get prediction for the last position
-            next_token_logits = outputs.logits[:, -1, :]
-            next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+    # DECODE: Generate tokens one at a time using cached K, V
+    for _ in range(num_new_tokens - 1):
+        outputs = model.forward_with_kv_cache(next_token, outputs)
+        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
-            # Append new token to sequence
-            current_ids = torch.cat([current_ids, next_token], dim=1)
-
-    return current_ids
+    return generated_ids
 ```
 
-As you can see the complexity is square, because each step is linear.
-So to summarize the ideas behind KV cache are:
-* To use old computed kv caches, because a) all layers except for attention work on tokens independently and do not change when new tokens are added b) attention also does not change the state of previous tokens because the do not attend on future tokens
-* To calculate only last token attention to previous tokens making each step not squared but linear
+**Complexity:** Prefill is $O(P^2)$ for prompt length $P$. Each decode step is $O(n)$ where $n$ is the current sequence length. Total: $O(P^2 + N \cdot P + N^2) \approx O(N^2)$ for $N >> P$.
 
+This is a **massive improvement**—from cubic to quadratic. For 1000-token generation, that's roughly 1000x faster attention computation.
 
-# Pitfalls of naive generation and Continous Batching algorithm
-Now that we understand how KV-cache allows us to circumvent cubic generation time let's take a look at another problem associated with  transformer inference: generating on sequences of various lengths.
-All modern frameworks batch user requests together - serving them one by one would underutilize the GPU and work slowly, so it makes sense to batch generation together. The problem here is that all sequence require answers of different lengths. For example let's say you've bathced 2 requests from different user, one simple yes or no question and the other question requires more tokens. For example:
+You can find the complete code [here](https://gist.github.com/hawkeoni/2920d1a2f59840eb673455b40137c73c).
 
-Request 1: "Is Python dynamically typed? Answer yes or no."
-Request 2: "Explain the difference between TCP and UDP protocols."
+---
 
-Here's how generation proceeds with naive batching after the prefill stage:
+# Prefill vs Decode: Two Phases of Generation
 
+The KV-cache optimization naturally divides generation into two distinct phases:
 
+**Prefill Phase:**
+- Processes the entire input prompt in one forward pass
+- Computes K, V for all prompt tokens simultaneously
+- Builds the initial KV cache
+- Compute-bound: lots of matrix multiplications
+- $O(P^2)$ complexity for prompt length $P$
+
+**Decode Phase:**
+- Generates tokens one at a time
+- Only computes K, V for the new token
+- Extends the KV cache by one position each step
+- Memory-bound: small computation, but needs to read entire cache
+- $O(n)$ per step
+
+```
+[DIAGRAM PLACEHOLDER: Prefill vs Decode Phases]
+
+Show a timeline:
+1. Prefill: [=======] Process entire prompt, build KV cache
+2. Decode:  [.][.][.][.][.] Generate tokens one by one, extend cache
+
+Visualize KV cache growth:
+- After prefill: [████████] (prompt tokens)
+- After decode step 1: [████████▓]
+- After decode step 2: [████████▓▓]
+- ...
+
+█ = prefilled K,V    ▓ = generated K,V
+```
+
+This distinction matters for continuous batching because prefill and decode have very different computational characteristics, and we need to manage them carefully.
+
+---
+
+# The Problem: Naive Batching Wastes Compute
+
+Now that we understand KV-cache, let's look at another problem: batching sequences of different lengths.
+
+Modern inference frameworks batch user requests together—serving them one by one would underutilize the GPU. But different requests need different output lengths. Consider batching these two requests:
+
+**Request 1:** "Is Python dynamically typed? Answer yes or no."
+**Request 2:** "Explain the difference between TCP and UDP protocols."
+
+Here's how generation proceeds with naive batching:
+
+```
 Turn    | Request 1 (short)     | Request 2 (long)
 --------|-----------------------|------------------------
   1     | "Yes"                 | "TCP"
   2     | ","                   | "and"
   3     | "Python"              | "UDP"
   4     | "is"                  | "are"
-  5     | "\<EOS>"              | "both"
-  6     | \<padding>            | "transport"
-  7     | \<padding>            | "layer"
-  8     | \<padding>            | "protocols"
-  9     | \<padding>            | "."
- 10     | \<padding>            | "TCP"
- 11     | \<padding>            | "provides"
- ...    | \<padding>            | ...
- 30     | \<padding>            | "\<EOS>"
+  5     | <EOS> ✓               | "both"
+  6     | <padding>             | "transport"
+  7     | <padding>             | "layer"
+  8     | <padding>             | "protocols"
+  ...   | <padding>             | ...
+ 30     | <padding>             | <EOS> ✓
+```
 
-The problem is clear: Request 1 finishes at turn 5, but we can't return its response to the user until Request 2 completes at turn 30. Meanwhile, the GPU slot for Request 1 sits idle, wasting compute on generating tokens that the user will not see because generation was terminated with \<EOS>. What we'd like to do is switch request 1 for request 3 after it finishes so we'd never lose compute. 
+**The problem:** Request 1 finishes at turn 5, but we can't return it until Request 2 completes at turn 30. The GPU slot for Request 1 sits idle, wasting compute on padding.
 
-For example if Request 3 is "What is the capital of Paris" the generations may look something like this:
+**The solution:** Swap Request 1 out and bring in a new Request 3:
 
+```
 Turn    | Slot A                | Slot B
 --------|-----------------------|------------------------
   1     | Req1: "Yes"           | Req2: "TCP"
   2     | Req1: ","             | Req2: "and"
   3     | Req1: "Python"        | Req2: "UDP"
   4     | Req1: "is"            | Req2: "are"
-  5     | Req1: "<EOS>" ✓ DONE  | Req2: "both"
+  5     | Req1: <EOS> ✓ DONE    | Req2: "both"
   6     | Req3: "The"    ← NEW  | Req2: "transport"
   7     | Req3: "capital"       | Req2: "layer"
   8     | Req3: "is"            | Req2: "protocols"
   9     | Req3: "Paris"         | Req2: "."
- 10     | Req3: "<EOS>" ✓ DONE  | Req2: "TCP"
+ 10     | Req3: <EOS> ✓ DONE    | Req2: "TCP"
  11     | Req4: "..." ← NEW     | Req2: "provides"
  ...    |                       | ...
+```
 
-This is the core idea behind continuous batching: instead of waiting for the entire batch to complete, we continuously swap finished requests out and new requests in, maximizing GPU utilization and minimizing user latency. Request 1's response is returned immediately at turn 5, rather than waiting 25 more turns for Request 2 to finish and request 3 to start.
+This is **continuous batching**: instead of waiting for the entire batch to complete, we continuously swap finished requests out and new requests in. Request 1's response returns immediately at turn 5, and we maximize GPU utilization by keeping all slots busy.
 
-The problem here is that generation consists of 2 stages: prefill and decode and before we start generating Request 3 we need to actually prefill it and swap KV cache of Req1 to KV cache of Req3!
+The catch: when we swap Request 3 in, we need to **prefill** it first (build its KV cache), then align its cache with the existing sequences before continuing decode.
 
-TODO: write somewhere better that prefilling is basically KV-cache generation. In the next section we'll explore the naive continous batching algorithm in pytorch, how it manages memory and interleaves prefill stages with decode steps.
+---
 
-TODO: Add diagram showing prefill vs generation phases
+# The Continuous Batching Algorithm
 
-
-When serving Large Language Models (LLMs) in production, efficient GPU utilization is critical. Traditional batch processing has a fundamental flaw: all sequences in a batch must wait for the longest one to finish. Enter **continuous batching** - the technique that enables systems like vLLM and HuggingFace TGI to achieve remarkable throughput improvements.
-
-In this post, I'll walk through my [PyTorch implementation of continuous batching](https://github.com/hawkeoni/continuous_batching_pytorch) and explain the core algorithm that achieves **~40% faster inference** compared to synchronous batching.
-
-
-## The Continuous Batching Algorithm
-
-Here's the core generation loop:
+Here's the core generation loop from my [PyTorch implementation](https://github.com/hawkeoni/continuous_batching_pytorch):
 
 ```python
 def _run_generation_loop(self, texts, batch, results, pbar):
@@ -374,13 +328,13 @@ def _run_generation_loop(self, texts, batch, results, pbar):
             )
 ```
 
-Notice that `batch_size` appears seemingly out of nowhere—it's a configuration parameter that limits how many sequences we process simultaneously. In production frameworks like vLLM or TensorRT-LLM, the limit isn't a fixed sample count but rather a **cumulative token budget** (total tokens across all sequences in the batch). This allows for dynamic allocation: many short sequences or fewer long ones. For simplicity, we use a fixed batch size here.
+Notice that `batch_size` is a configuration parameter limiting simultaneous sequences. In production frameworks like vLLM or TensorRT-LLM, the limit isn't a fixed sample count but rather a **cumulative token budget** (total tokens across all sequences). This allows dynamic allocation: many short sequences or fewer long ones. For simplicity, we use a fixed batch size.
 
 Let's break down each component.
 
 ---
 
-### Prefill Decision: When to Add New Sequences
+## Prefill Decision: When to Add New Sequences
 
 ```python
 def _should_prefill(self, batch: _Batch) -> bool:
@@ -392,23 +346,17 @@ def _should_prefill(self, batch: _Batch) -> bool:
     return has_capacity and meets_threshold
 ```
 
-We prefill when two conditions are met:
-1. **Capacity**: The batch isn't full yet
+We prefill when:
+1. **Capacity**: The batch isn't full
 2. **Threshold**: Waiting texts meet a fraction threshold relative to active texts
 
-The `fraction` parameter controls how aggressively we batch new requests. A fraction of 1.0 means "wait until we have as many waiting requests as active ones before prefilling." A fraction of 0.0 would prefill immediately whenever there's capacity.
+The `fraction` parameter controls batching aggressiveness. A fraction of 1.0 means "wait until we have as many waiting requests as active ones." A fraction of 0.0 prefills immediately when there's capacity.
 
-**Note:** Production frameworks use more sophisticated decision rules. They might consider:
-- Current memory pressure and KV cache utilization
-- Estimated completion time of active sequences
-- Priority levels of waiting requests
-- Whether prefill would cause memory reallocation
-
-Our simple threshold-based approach works well enough for demonstration purposes.
+**Note:** Production frameworks use more sophisticated rules considering memory pressure, estimated completion times, request priorities, and whether prefill would cause reallocation. Our threshold-based approach is a simplification.
 
 ---
 
-### Prefill Stage: Building the KV Cache
+## Prefill Stage: Building the KV Cache
 
 ```python
 def _prefill_waiting_texts(self, batch: _Batch) -> None:
@@ -425,16 +373,15 @@ def _prefill_waiting_texts(self, batch: _Batch) -> None:
         self._expand_batch_with_prefill(batch, prefill_outputs, inputs)
 ```
 
-The prefill stage processes complete input sequences to build their KV cache. Here's what happens:
+The prefill stage:
+1. **Tokenizes** waiting texts into padded tensors
+2. **Forward pass** with `use_cache=True` returns logits and the computed KV cache
+3. **Stores** the KV cache for future decode steps
 
-1. **Tokenize** all waiting texts into padded tensors
-2. **Forward pass** through the model with `use_cache=True` — this returns both logits and the computed KV cache
-3. **Store the KV cache** for future decode steps
-
-When expanding an existing batch with new sequences, we need to handle a tricky alignment problem. The existing sequences have been generating for a while, so their KV cache is longer than the newly prefilled sequences:
+When expanding an existing batch, we face an alignment problem—existing sequences have longer KV caches than newly prefilled ones:
 
 ```
-[IMAGE PLACEHOLDER: KV Cache Alignment During Prefill Expansion]
+[DIAGRAM PLACEHOLDER: KV Cache Alignment During Prefill Expansion]
 
 Existing sequences (already generating):
 ┌─────────────────────────────────────────────────────────┐
@@ -474,7 +421,7 @@ def _expand_kv_cache(self, batch, prefill_outputs):
 
 ---
 
-### Generate One Step: The Decode Phase
+## Generate One Step: The Decode Phase
 
 ```python
 def _generate_one_step(self, batch: _Batch) -> None:
@@ -495,16 +442,13 @@ def _generate_one_step(self, batch: _Batch) -> None:
         dim=1
     )
 
-    # Increment generation counter
     batch.generated_tokens_counter += 1
 ```
 
-Each decode step processes all active sequences in parallel. The key insight is that we only pass the **last generated token** as input (`input_ids` has shape `[batch_size, 1]`), while the KV cache contains the full history.
-
-After each step, the KV cache grows by one position for every sequence:
+Each decode step processes all active sequences in parallel. We only pass the **last generated token** as input, while the KV cache contains the full history.
 
 ```
-[IMAGE PLACEHOLDER: KV Cache Growth During Decode Steps]
+[DIAGRAM PLACEHOLDER: KV Cache Growth During Decode Steps]
 
 Step 0 (after prefill):
 Seq 1: [████████████████████] len=20
@@ -524,15 +468,12 @@ Seq 3: [████████████████████▓▓▓▓
 █ = prefilled tokens    ▓ = generated tokens
 ```
 
-The attention mask and position IDs are also extended each step to account for the new token.
-
 ---
 
-### Collecting Finished Samples: Stopping Criteria and Cache Surgery
+## Collecting Finished Samples: Stopping Criteria and Cache Surgery
 
 ```python
 def _find_finished_indices(self, batch: _Batch) -> List[int]:
-    # Check if sample hit EOS or max length
     is_eos = batch.input_ids == self.tokenizer.eos_token_id
     is_max_length = (
         batch.generated_tokens_counter.unsqueeze(1) >=
@@ -544,11 +485,11 @@ def _find_finished_indices(self, batch: _Batch) -> List[int]:
     return finished_indices
 ```
 
-A sequence finishes when either:
-1. **EOS token**: The model generated the end-of-sequence token
-2. **Max length**: The sequence reached the configured `max_new_tokens` limit
+A sequence finishes when:
+1. **EOS token**: The model generated end-of-sequence
+2. **Max length**: Reached `max_new_tokens` limit
 
-When sequences finish, we need to surgically remove them from all batch tensors:
+When sequences finish, we surgically remove them from all batch tensors:
 
 ```python
 def _remove_samples_from_batch(self, batch, keep_indices):
@@ -564,24 +505,19 @@ def _remove_samples_from_batch(self, batch, keep_indices):
         layer_cache.values = layer_cache.values.index_select(0, keep_indices)
 ```
 
-**This is expensive.** The `index_select` operation on the KV cache allocates new memory and copies all the data for the remaining sequences. For a model with 32 layers, we're doing 64 tensor copies (keys + values for each layer). With large batch sizes and long sequences, this becomes a significant overhead.
+**This is expensive.** The `index_select` operation allocates new memory and copies all data for remaining sequences. For a 32-layer model, that's 64 tensor copies per removal. Production frameworks solve this with:
 
-Production frameworks solve this with sophisticated memory management:
-- **PagedAttention** (vLLM): Treats KV cache as virtual memory pages, allowing non-contiguous storage and efficient "freeing" of finished sequences
-- **Pre-allocated pools**: Reserve maximum memory upfront and manage slots with indices rather than copying
-- **In-place compaction**: Move data within the same buffer rather than allocating new ones
+- **PagedAttention** (vLLM): Treats KV cache as virtual memory pages, allowing efficient "freeing"
+- **Pre-allocated pools**: Reserve max memory upfront, manage slots with indices
+- **In-place compaction**: Move data within the same buffer
 
-Our naive implementation just accepts the performance hit for simplicity.
+Our naive implementation accepts the performance hit for simplicity.
 
-**Important connection to prefill decision:** Notice how `_collect_finished_samples` modifies `batch.texts_decoding` by removing finished sequences. This directly affects the `_should_prefill` check:
+**Connection to prefill:** When sequences finish, `len(batch.texts_decoding)` decreases, creating capacity for `_should_prefill` to trigger. Finished sequences create "slots" for new ones—this is the heart of continuous batching.
 
-```python
-has_capacity = len(batch.texts_decoding) < self.config.batch_size
-```
+---
 
-When sequences finish and are removed, `len(batch.texts_decoding)` decreases, creating capacity for new sequences to be prefilled. This is the core of continuous batching—finished sequences create "slots" that waiting sequences can fill.
-
-## Benchmark Results
+# Benchmark Results
 
 Testing with **Qwen3-8B** on 100 samples:
 
@@ -590,110 +526,85 @@ Testing with **Qwen3-8B** on 100 samples:
 | Total Runtime | 107.8s | 64.6s | **40% faster** |
 | Generation Speed | 28.9 tok/s | 49.1 tok/s | **70% faster** |
 | Per-sample Latency | 3.19s | 1.94s | **39% lower** |
-| Correctness | - | 99% match | - |
+| Correctness | - | 99% match | ✓ |
 
+---
 
-## Conclusion
+# Conclusion
 
-Continuous batching is a fundamental technique for efficient LLM serving. By dynamically managing the batch as sequences complete, we achieve significantly better GPU utilization.
+Continuous batching is a fundamental technique for efficient LLM serving. By dynamically managing the batch as sequences complete, we achieve significantly better GPU utilization and lower latency.
+
+The key ideas:
+1. **KV-cache** avoids redundant computation by caching Key and Value projections
+2. **Prefill** builds the initial cache for new sequences; **decode** extends it one token at a time
+3. **Continuous batching** swaps finished sequences out and new ones in, keeping GPU slots busy
 
 The full implementation is available at [github.com/hawkeoni/continuous_batching_pytorch](https://github.com/hawkeoni/continuous_batching_pytorch).
 
-## Advanced topics
-Chunked prefill is a technique where prefill stage is split into stpes.
-For example we have a sequence of length 8000 and we want to prefill it in chunks of 1000 tokens, so the prefill would go as:
+---
 
+# Advanced Topics
 
-Iteration 1:
+## Chunked Prefill
 
-Take tokens 0–999 (first 1k chunk)
-Run forward pass, compute attention over these 1k tokens
-Store KV cache for positions 0–999
-No token generated yet (still prefilling)
-Iteration 2:
+Long prompts create a problem: prefilling an 8000-token sequence monopolizes the GPU while decode requests wait. **Chunked prefill** splits the prefill into smaller pieces that can be interleaved with decode steps.
 
-Take tokens 1000–1999
-Run forward pass, attention can now attend to positions 0–1999 (using cached KV for 0–999, computing new for 1000–1999)
-Append KV cache for positions 1000–1999
-Still no token generated
+For an 8000-token prompt with 1000-token chunks:
+
+| Iteration | Action | KV Cache State |
+|-----------|--------|----------------|
+| 1 | Prefill tokens 0–999 | Cache positions 0–999 |
+| 2 | Prefill tokens 1000–1999 | Cache positions 0–1999 |
+| 3 | Prefill tokens 2000–2999 | Cache positions 0–2999 |
+| ... | ... | ... |
+| 8 | Prefill tokens 7000–7999 | Cache complete (0–7999) |
+| 9 | Begin decode phase | Generate first token |
+
+The key insight: each chunk computes new KV entries but attends to **all** previous KV entries from the cache.
+
+**Why this matters for continuous batching:** Between prefill iterations, we can batch decode steps from other requests:
+
+```
 Iteration 3:
+- Prefill chunk (tokens 2000–2999) for Request A
+- Decode step (1 token) for Request B
+- Decode step (1 token) for Request C
+All in one forward pass!
+```
 
-Tokens 2000–2999
-Attention over 0–2999
-KV cache grows
-...continues...
+Further reading:
+- [Sarathi paper (arxiv)](https://arxiv.org/pdf/2308.16369)
+- [HuggingFace blog on prefill/decode concurrency](https://huggingface.co/blog/tngtech/llm-performance-prefill-decode-concurrent-requests)
 
-Iteration 8:
+---
 
-Tokens 7000–7999 (final chunk)
-Attention over full 0–7999
-KV cache now complete for entire prompt
-Iteration 9:
+## Paged Attention
 
-Now decode phase begins
-Generate first output token
-Append its KV to cache
-The key insight:
+Paged attention is a memory management technique for KV caches, introduced in the [vLLM paper](https://arxiv.org/pdf/2309.06180).
 
-Each chunk only computes new KV entries, but attends to all previous KV entries from the cache. So chunk 5 computes KV for tokens 4000–4999 but attends to 0–4999.
+**The problem:** Standard implementations pre-allocate contiguous memory for each sequence's KV cache based on maximum possible length. If max length is 8k but a sequence only uses 500 tokens, you've wasted memory for 7500 tokens. This limits batch sizes.
 
-Why this matters for continuous batching:
+**The solution:** Borrow from OS virtual memory—divide KV cache into fixed-size **pages** (e.g., 16 or 32 tokens each). Each sequence gets a **block table** mapping logical positions to physical memory blocks.
 
-Between iterations 1–8, if another request's decode step is ready, you can batch them together. So iteration 3 might look like:
+```
+Sequence A needs 50 tokens:
+  Logical block 0 → Physical block 7
+  Logical block 1 → Physical block 3
+  Logical block 2 → Physical block 12
 
-Prefill chunk (tokens 2000–2999) for request A
-Decode step (1 token) for request B
-Decode step (1 token) for request C
-All in one forward pass, keeping everyone moving.
+Blocks don't need to be contiguous in GPU memory.
+```
 
+**Benefits:**
+- **Near-zero waste**: Only allocate what you use
+- **No fragmentation**: Uniform block sizes, any free block works
+- **Higher batch sizes**: Memory savings fit more sequences
+- **Easy sharing**: Beam search/parallel sampling can share blocks for common prefixes
 
-You can read more about chunked prefill here https://arxiv.org/pdf/2308.16369 and here https://huggingface.co/blog/tngtech/llm-performance-prefill-decode-concurrent-requests
+**Tradeoff:** The attention kernel is slightly slower due to indirection and non-contiguous memory access. But the memory efficiency gains—allowing 3x more sequences in a batch—lead to higher overall throughput.
 
+The vLLM paper showed 2-4x throughput improvements over HuggingFace's naive implementation, almost entirely from fitting more sequences in each batch.
 
+---
 
-Another trick is Paged attention it is a memory management technique for KV caches, introduced in the [vLLM paper](https://arxiv.org/pdf/2309.06180).
-
-The problem it solves:
-
-In standard attention, you pre-allocate a contiguous block of memory for each sequence's KV cache based on the maximum possible length. If your max length is 8k but a sequence only uses 500 tokens, you've wasted memory for 7500 tokens. And you can't reclaim it mid-inference.
-
-This leads to massive memory fragmentation and waste, limiting how many sequences you can batch together.
-
-How paged attention works:
-
-Borrow the idea from OS virtual memory—instead of contiguous allocation, divide KV cache into fixed-size blocks (pages), like 16 or 32 tokens each.
-
-Each sequence gets a block table that maps logical positions to physical memory blocks. Blocks are allocated on demand as the sequence grows.
-
-Example:
-
-Sequence A needs 50 tokens of KV cache:
-
-Allocate block 0 → physical block 7
-Allocate block 1 → physical block 3
-Allocate block 2 → physical block 12
-The blocks don't need to be contiguous in GPU memory. The block table tracks where everything lives.
-
-Benefits:
-
-Near-zero waste: Only allocate what you actually use
-No fragmentation: Blocks are uniform size, any free block works
-Higher batch sizes: Memory savings let you fit more concurrent sequences
-Easy memory sharing: For beam search or parallel sampling, multiple sequences can point to the same physical blocks for shared prefixes
-Tradeoff:
-
-Slightly more complex attention kernel—instead of one contiguous read, you gather from scattered blocks. But the memory efficiency gains far outweigh this.
-
-It's one of the core innovations that made vLLM so much more efficient than naive serving implementations.
-
-so this is just for memory efficiency without speedup? the speed is probably worse because of the lack of contiguous blocks of memory?
-
-Exactly right. Paged attention by itself is a memory optimization, not a speed optimization. The attention kernel is actually slightly slower due to the indirection and non-contiguous memory access.
-
-But—and this is the key—the memory savings indirectly lead to higher throughput.
-
-If you can fit 3x more sequences in a batch because you're not wasting memory, your GPU utilization goes up and you process more tokens per second overall, even if each individual attention operation is marginally slower.
-
-
-The vLLM paper showed something like 2-4x throughput improvements over HuggingFace's naive implementation, almost entirely from being able to batch more sequences thanks to memory efficiency.
-
+*Questions or feedback? Open an issue on the [GitHub repo](https://github.com/hawkeoni/continuous_batching_pytorch).*

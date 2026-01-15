@@ -1,0 +1,71 @@
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f7f7">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#1b1b1e">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta
+    name="viewport"
+    content="width=device-width, user-scalable=no initial-scale=1, shrink-to-fit=no, viewport-fit=cover"
+  >
+
+  {% capture seo_tags %}
+    {% seo title=false %}
+  {% endcapture %}
+
+  {% if seo_tags contains '<title>' %}
+    {{ seo_tags }}
+  {% else %}
+    {{ seo_tags }}
+    <title>{{ site.title }}</title>
+  {% endif %}
+
+  {% include_cached favicons.html %}
+
+  {% if site.resources.ignore_env != jekyll.environment and site.resources.self_host %}
+    <link href="{{ site.data.origin[type].webfonts | relative_url }}" rel="stylesheet">
+  {% else %}
+    {% for cdn in site.data.origin[type].cdns %}
+      <link rel="preconnect" href="{{ cdn.url }}" {{ cdn.args }}>
+    {% endfor %}
+
+    {% capture urls %}{{ site.data.origin[type].webfonts }}{% endcapture %}
+    {% assign urls = urls | newline_to_br | split: '<br />' %}
+    {% for url in urls %}
+      <link rel="stylesheet" href="{{ url }}">
+    {% endfor %}
+  {% endif %}
+
+  <!-- Theme stylesheet -->
+  {% assign _style_url = '/assets/css/jekyll-theme-chirpy.css' | relative_url %}
+  <link rel="stylesheet" href="{{ _style_url }}">
+
+  <!-- Custom stylesheet -->
+  <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+
+  {% if site.toc and page.toc %}
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/tocbot@4/dist/tocbot.css">
+  {% endif %}
+
+  {% if page.layout == 'post' %}
+    <link rel="stylesheet" href="{{ '/assets/css/jekyll-theme-chirpy.css' | relative_url }}">
+  {% endif %}
+
+  {% if page.math %}
+    {% include mathjax-loader.html %}
+  {% endif %}
+
+  {% if page.mermaid %}
+    {% include mermaid-loader.html %}
+  {% endif %}
+
+  {% if jekyll.environment == 'production' %}
+    {% if site.google_analytics.id != empty and site.google_analytics.id %}
+      {% include google-analytics.html %}
+    {% endif %}
+
+    {% if site.pwa.enabled %}
+      <link rel="manifest" href="{{ 'manifest.webmanifest' | relative_url }}">
+    {% endif %}
+  {% endif %}
+</head>

@@ -1,0 +1,22 @@
+---
+---
+
+/* Hide the right sidebar panel (Recently Updated, Trending Tags) */
+#panel-wrapper {
+  display: none !important;
+}
+
+/* Expand the main content to use the full width */
+#main-wrapper .container {
+  max-width: 100% !important;
+}
+
+#main-wrapper .col-xl-8 {
+  flex: 0 0 100% !important;
+  max-width: 100% !important;
+}
+
+/* Also handle the post content width */
+.post-content {
+  max-width: none !important;
+}
