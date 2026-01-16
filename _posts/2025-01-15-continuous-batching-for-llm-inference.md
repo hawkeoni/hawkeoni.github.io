@@ -12,7 +12,7 @@ description: "A deep dive into continuous batching - the technique that powers e
 
 # Introduction
 
-One day I was reading a lecture about LLM inference frameworks and what optimizations make them fast: dynamic batching, efficient memory management (memory reuse), efficient kernels/fused operations, various model parallellisms (tensor parallel/pipeline parallel inference), quantization, speculative decoding, **KV-cache** and **continuous batching**. After I described continuous batching one of the students asked if there was a simple implementation. I knew that digging in the source code of such frameworks as [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), [vLLM](https://github.com/vllm-project/vllm) or [SGLang](https://github.com/sgl-project/sglang) would be too hard, so I tried looking for some open source implementations. This was before [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm), [mini-SGLang](https://github.com/sgl-project/mini-sglang) or support of [continuous batching in transformers](https://huggingface.co/docs/transformers/main/continuous_batching) so I've searched the internet and found a link to a [reference implementation in pytorch](https://inspiringlab.com.np/implementing-continuous-batching-from-scratch-with-pytorch/) which looked __good enough__. I however quickly found that this was not the case: the code did not work. In fact it did not constitute a program: there were no imports, the code referenced classes and functions that were never described anywhere and no matter how you permuted the provided code snippets you could never compose anything that would launch. I guess it could be considered almost a pseudo-code implementation, but this was not something that I was looking for, so I took it upon myself to write a simple implementation in pytorch.
+One day I was reading a lecture about LLM inference frameworks and what optimizations make them fast: dynamic batching, efficient memory management (memory reuse), efficient kernels/fused operations, various model parallellisms (tensor parallel/pipeline parallel inference), quantization, speculative decoding, **KV-cache** and **continuous batching**. After I described continuous batching one of the students asked if there was a simple implementation in pytorch. I knew that digging in the source code of such frameworks as [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), [vLLM](https://github.com/vllm-project/vllm) or [SGLang](https://github.com/sgl-project/sglang) would be too hard, so I tried looking for some open source implementations. This was before [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm), [mini-SGLang](https://github.com/sgl-project/mini-sglang) or support of [continuous batching in transformers](https://huggingface.co/docs/transformers/main/continuous_batching) so I've searched the internet and found a link to a [reference implementation in pytorch](https://inspiringlab.com.np/implementing-continuous-batching-from-scratch-with-pytorch/) which looked __good enough__. I however quickly found that this was not the case: the code did not work. In fact it did not constitute a program: there were no imports, the code referenced classes and functions that were never described anywhere and no matter how you permuted the provided code snippets you could never compose anything that would launch. I guess it could be considered almost a pseudo-code implementation, but this was not something that I was looking for, so I took it upon myself to write a simple implementation in pytorch.
 
 **In this post I will cover:**
 - [Background: Autoregressive Generation](#background-autoregressive-generation) — how decoder-only transformers generate text
@@ -44,7 +44,7 @@ Step 3: Model sees "The capital of France is Paris," → predicts "which"
 
 Each step requires a full forward pass through the model. The key insight is that we're repeatedly processing the same prefix tokens over and over—"The capital of France is" gets processed in step 1, then again (along with "Paris") in step 2, and so on.
 
-This is exctemely inefficient. Can we avoid recomputing the same thing repeatedly? Yes—that's where KV-cache comes in.
+We can actually avoid recomputing the same thing repeatedly, and that's where KV-cache comes in.
 
 ---
 
@@ -68,6 +68,8 @@ Because of the causal mask, token representations at position $i$ only depend on
 
 This means we can **cache** the Key and Value projections from previous tokens and reuse them when generating new tokens.
 
+![Attention mask](/assets/img/lower_triangle_attention_mask.png){: .normal }
+_This is the caption text_
 ```
 [DIAGRAM PLACEHOLDER: Causal Attention Matrix]
 
