@@ -12,4 +12,4 @@ CMC MSU 2015-2021
 
 Currently training VLMs @ Yandex
 
-Feel free to conctact me at Telegram <a href="https://t.me/HawkeOni" target="_blank">@HawkeOni</a>
+Feel free to contact me at Telegram <a href="https://t.me/HawkeOni" target="_blank">@HawkeOni</a> or via email at <a href="mailto:ilyadimov98@gmail.com">ilyadimov98@gmail.com</a>
