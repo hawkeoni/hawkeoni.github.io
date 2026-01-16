@@ -1,10 +1,11 @@
 ---
 layout: post
 title: "Continuous Batching for LLM Inference: A PyTorch Implementation"
-date: 2025-01-15 12:00:00 +0000
+date: 2025-01-17 12:00:00 +0000
 categories: [Deep Learning, LLM]
 tags: [pytorch, inference, optimization, transformers]
 toc: true
+math: true
 comments: true
 description: "A deep dive into continuous batching - the technique that powers efficient LLM inference."
 ---
@@ -14,13 +15,13 @@ description: "A deep dive into continuous batching - the technique that powers e
 One day I was reading a lecture about LLM inference frameworks and what optimizations make them fast: dynamic batching, efficient memory management (memory reuse), efficient kernels/fused operations, various model parallellisms (tensor parallel/pipeline parallel inference), quantization, speculative decoding, **KV-cache** and **continuous batching**. After I described continuous batching one of the students asked if there was a simple implementation. I knew that digging in the source code of such frameworks as [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), [vLLM](https://github.com/vllm-project/vllm) or [SGLang](https://github.com/sgl-project/sglang) would be too hard, so I tried looking for some open source implementations. This was before [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm), [mini-SGLang](https://github.com/sgl-project/mini-sglang) or support of [continuous batching in transformers](https://huggingface.co/docs/transformers/main/continuous_batching) so I've searched the internet and found a link to a [reference implementation in pytorch](https://inspiringlab.com.np/implementing-continuous-batching-from-scratch-with-pytorch/) which looked __good enough__. I however quickly found that this was not the case: the code did not work. In fact it did not constitute a program: there were no imports, the code referenced classes and functions that were never described anywhere and no matter how you permuted the provided code snippets you could never compose anything that would launch. I guess it could be considered almost a pseudo-code implementation, but this was not something that I was looking for, so I took it upon myself to write a simple implementation in pytorch.
 
 **In this post I will cover:**
-- How autoregressive generation works in decoder-only transformers
-- The KV-cache optimization and why it's essential
-- The prefill and decode phases of generation
-- Why naive batching wastes compute and how continuous batching solves it
-- A walkthrough of a naive continuous batching implementation in PyTorch
-- Benchmark results showing ~40% speedup over synchronous batching
-- Advanced topics: chunked prefill and paged attention
+- [Background: Autoregressive Generation](#background-autoregressive-generation) — how decoder-only transformers generate text
+- [KV-Cache](#kv-cache-avoiding-redundant-computation) — the optimization that makes generation 1000x times faster
+- [Prefill vs Decode](#prefill-vs-decode-two-phases-of-generation) — two distinct phases of generation
+- [The Problem: Naive Batching](#the-problem-naive-batching-wastes-compute) — why simple batching wastes compute and how continuous batching solves this
+- [The Continuous Batching Algorithm](#the-continuous-batching-algorithm) — a PyTorch implementation walkthrough
+- [Benchmark Results](#benchmark-results) — ~40% speedup over synchronous batching and comparison to [continuous batching in transformers](https://huggingface.co/docs/transformers/main/continuous_batching)
+- [Advanced Topics](#advanced-topics) — preparing you to dive right into chunked prefill and paged attention
 
 The full implementation is available at [github.com/hawkeoni/continuous_batching_pytorch](https://github.com/hawkeoni/continuous_batching_pytorch).
 
@@ -43,7 +44,7 @@ Step 3: Model sees "The capital of France is Paris," → predicts "which"
 
 Each step requires a full forward pass through the model. The key insight is that we're repeatedly processing the same prefix tokens over and over—"The capital of France is" gets processed in step 1, then again (along with "Paris") in step 2, and so on.
 
-This is wasteful. Can we avoid recomputing the same thing repeatedly? Yes—that's where KV-cache comes in.
+This is exctemely inefficient. Can we avoid recomputing the same thing repeatedly? Yes—that's where KV-cache comes in.
 
 ---
 
@@ -57,7 +58,7 @@ Two key observations make KV-caching possible:
 
 **1. Attention is the only layer where tokens interact.**
 
-All other layers—FFN/MLP, layer norms, embeddings, the final linear layer—operate on each token independently. Only the attention layer requires the full sequence:
+All other layers—FFN/MLP, layer norms, embeddings, the final linear layer—operate on each token independently. Only the attention layer requires the full token sequence:
 
 $$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
 
@@ -79,7 +80,7 @@ Show a lower-triangular attention matrix where:
 
 ## Generation Without KV-Cache (Naive)
 
-Let's walk through a minimal implementation. First, a simplified transformer that only has the components relevant to KV-caching:
+Let's walk through a [minimal implementation](https://gist.github.com/hawkeoni/2920d1a2f59840eb673455b40137c73c). First, a simplified transformer that only has the components relevant to KV-caching:
 
 ```python
 class SimpleCausalAttentionLLM(nn.Module):
@@ -607,4 +608,4 @@ The vLLM paper showed 2-4x throughput improvements over HuggingFace's naive impl
 
 ---
 
-*Questions or feedback? Open an issue on the [GitHub repo](https://github.com/hawkeoni/continuous_batching_pytorch).*
+*Questions or feedback? Open an issue on the [GitHub repo](https://github.com/hawkeoni/continuous_batching_pytorch) or [contact me directly](/about/).*
